@@ -1,0 +1,21 @@
+[package]
+name = "rh2"
+version = "0.0.1"
+edition = "2021"
+description = "Rust-backed sans-IO HTTP/2 codec for Python, wrapping the h2 crate"
+license = "BSD-3-Clause"
+
+[lib]
+name = "rh2"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+h2 = "0.4"
+http = "1"
+bytes = "1"
+tokio = { version = "1", features = ["io-util"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
