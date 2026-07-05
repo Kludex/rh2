@@ -40,9 +40,23 @@ fn noop_waker() -> Waker {
 
 #[derive(Default)]
 struct IoInner {
-    inbound: VecDeque<u8>,
+    // Contiguous buffer + read cursor so poll_read can bulk-copy instead of
+    // popping a byte at a time.
+    inbound: Vec<u8>,
+    inbound_pos: usize,
     outbound: Vec<u8>,
     inbound_closed: bool,
+}
+
+impl IoInner {
+    fn push_inbound(&mut self, data: &[u8]) {
+        // Drop already-consumed bytes before growing, keeping the buffer small.
+        if self.inbound_pos > 0 {
+            self.inbound.drain(0..self.inbound_pos);
+            self.inbound_pos = 0;
+        }
+        self.inbound.extend_from_slice(data);
+    }
 }
 
 #[derive(Clone)]
@@ -61,16 +75,21 @@ impl AsyncRead for SharedIo {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let mut inner = self.0.borrow_mut();
-        if inner.inbound.is_empty() {
+        let avail = inner.inbound.len() - inner.inbound_pos;
+        if avail == 0 {
             // EOF once the peer half-closed and we've drained everything.
             if inner.inbound_closed {
                 return Poll::Ready(Ok(()));
             }
             return Poll::Pending;
         }
-        let n = std::cmp::min(buf.remaining(), inner.inbound.len());
-        for _ in 0..n {
-            buf.put_slice(&[inner.inbound.pop_front().unwrap()]);
+        let n = std::cmp::min(buf.remaining(), avail);
+        let start = inner.inbound_pos;
+        buf.put_slice(&inner.inbound[start..start + n]);
+        inner.inbound_pos += n;
+        if inner.inbound_pos == inner.inbound.len() {
+            inner.inbound.clear();
+            inner.inbound_pos = 0;
         }
         Poll::Ready(Ok(()))
     }
@@ -408,7 +427,7 @@ impl H2Connection {
 
     /// Feed bytes received from the peer; returns the events they produced.
     fn receive_data(&mut self, py: Python<'_>, data: &[u8]) -> PyResult<Vec<PyObject>> {
-        self.io.0.borrow_mut().inbound.extend(data.iter().copied());
+        self.io.0.borrow_mut().push_inbound(data);
         self.pump(py)?;
         Ok(self.events.drain(..).collect())
     }
@@ -421,10 +440,15 @@ impl H2Connection {
     }
 
     /// Drain bytes that must be written to the peer.
-    fn data_to_send<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyBytes> {
+    ///
+    /// The state-changing calls (`send_headers`, `send_data`, ...) only mutate
+    /// local state; the connection is driven here, so a burst of them coalesces
+    /// into a single pump instead of re-driving the whole machine per call.
+    fn data_to_send<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        self.pump(py)?;
         let mut inner = self.io.0.borrow_mut();
         let out = std::mem::take(&mut inner.outbound);
-        PyBytes::new_bound(py, &out)
+        Ok(PyBytes::new_bound(py, &out))
     }
 
     /// Send response headers on a stream. `headers` is a list of (name, value) byte pairs;
@@ -432,7 +456,6 @@ impl H2Connection {
     #[pyo3(signature = (stream_id, status, headers, end_stream=false))]
     fn send_headers(
         &mut self,
-        py: Python<'_>,
         stream_id: u32,
         status: u16,
         headers: Vec<(Vec<u8>, Vec<u8>)>,
@@ -467,54 +490,45 @@ impl H2Connection {
         if !end_stream {
             self.send_streams.insert(stream_id, send);
         }
-        self.pump(py)?;
         Ok(())
     }
 
     #[pyo3(signature = (stream_id, data, end_stream=false))]
-    fn send_data(
-        &mut self,
-        py: Python<'_>,
-        stream_id: u32,
-        data: Vec<u8>,
-        end_stream: bool,
-    ) -> PyResult<()> {
+    fn send_data(&mut self, stream_id: u32, data: &[u8], end_stream: bool) -> PyResult<()> {
+        // Take `&[u8]` (buffer protocol, zero-copy view) rather than `Vec<u8>`,
+        // which PyO3 would fill element-by-element - O(n) Python int conversions.
         self.pending_send
             .entry(stream_id)
             .or_default()
-            .push_back((Bytes::from(data), end_stream));
-        self.pump(py)?;
+            .push_back((Bytes::copy_from_slice(data), end_stream));
         Ok(())
     }
 
     #[pyo3(signature = (stream_id, error_code=8))]
-    fn reset_stream(&mut self, py: Python<'_>, stream_id: u32, error_code: u32) -> PyResult<()> {
+    fn reset_stream(&mut self, stream_id: u32, error_code: u32) -> PyResult<()> {
         if let Some(mut send) = self.send_streams.remove(&stream_id) {
             send.send_reset(h2::Reason::from(error_code));
         }
         self.responders.remove(&stream_id);
         self.recv_streams.remove(&stream_id);
         self.pending_send.remove(&stream_id);
-        self.pump(py)?;
         Ok(())
     }
 
     /// Acknowledge that the app consumed `size` bytes of a request body, refilling
     /// the stream-level flow-control window.
-    fn acknowledge_data(&mut self, py: Python<'_>, stream_id: u32, size: usize) -> PyResult<()> {
+    fn acknowledge_data(&mut self, stream_id: u32, size: usize) -> PyResult<()> {
         if let Some(recv) = self.recv_streams.get_mut(&stream_id) {
             let _ = recv.flow_control().release_capacity(size);
         }
-        self.pump(py)?;
         Ok(())
     }
 
     /// Begin a graceful shutdown (send GOAWAY).
-    fn close_connection(&mut self, py: Python<'_>) -> PyResult<()> {
+    fn close_connection(&mut self) -> PyResult<()> {
         if let State::Ready(conn) = &mut self.state {
             conn.graceful_shutdown();
         }
-        self.pump(py)?;
         Ok(())
     }
 }
