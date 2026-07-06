@@ -26,8 +26,9 @@ jobs:
             target: aarch64
           - runner: windows-latest
             target: x64
-          - runner: macos-13
-            target: x86_64
+          # macOS Apple Silicon. Intel-mac (macos-13) is omitted: its runners
+          # queue for hours on this repo and block the whole release. Intel-mac
+          # users can build from the published sdist.
           - runner: macos-14
             target: aarch64
     steps:
