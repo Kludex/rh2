@@ -1,6 +1,6 @@
 [package]
 name = "rh2"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "Rust-backed sans-IO HTTP/2 codec for Python, wrapping the h2 crate"
 license = "BSD-3-Clause"

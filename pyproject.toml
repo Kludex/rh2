@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "rh2"
-version = "0.0.1"
+version = "0.0.2"
 description = "Rust-backed sans-IO HTTP/2 codec for Python, wrapping the h2 crate"
 readme = "README.md"
 requires-python = ">=3.9"
